@@ -29,12 +29,73 @@
 #include <fstream>
 #include <iostream>
 #include <vector>
+#include <algorithm>
+#include <unordered_map>
+#include <cmath>
+#include <unordered_set>
+#include <cctype>
 
 #include "k_parser.h"
 
+struct TransformOp {
+    enum Type { TRANSL, ROTATE, SCALE } type;
+    // For TRANSL: a,b,c = dx,dy,dz
+    // For ROTATE: a,b,c = axis ux,uy,uz; d,e,f = center cx,cy,cz; g = angle(deg)
+    // For SCALE : a,b,c = sx,sy,sz; d,e,f = center cx,cy,cz (optional center; default 0)
+    double a = 0, b = 0, c = 0, d = 0, e = 0, f = 0, g = 0;
+};
+
+struct TransformDef {
+    int tid = 0;
+    std::vector<TransformOp> ops;
+};
+
+static std::unordered_map<int, TransformDef> gTransforms;
+
+static inline void apply_transform(double& x, double& y, double& z, const TransformDef& T)
+{
+    for (const auto& op : T.ops) {
+	if (op.type == TransformOp::TRANSL) {
+	    x += op.a; y += op.b; z += op.c;
+	}
+	else if (op.type == TransformOp::SCALE) {
+	    double cx = op.d, cy = op.e, cz = op.f;
+	    x = cx + (x - cx) * op.a;
+	    y = cy + (y - cy) * op.b;
+	    z = cz + (z - cz) * op.c;
+	}
+	else if (op.type == TransformOp::ROTATE) {
+	    double ux = op.a, uy = op.b, uz = op.c;
+	    double cx = op.d, cy = op.e, cz = op.f;
+	    double ang = op.g * 3.14 / 180.0;
+	    double len = std::sqrt(ux * ux + uy * uy + uz * uz);
+	    if (len == 0.0) continue;
+	    ux /= len; uy /= len; uz /= len;
+
+	    double px = x - cx, py = y - cy, pz = z - cz;
+	    double cA = std::cos(ang), sA = std::sin(ang);
+
+	    double vx = ux * py - uy * px ? (ux * py - uy * px) : (ux * py - uy * px);
+	    double vX = ux * py - uy * pz;
+
+	    double kxp = uy * pz - uz * py;
+	    double kyp = uz * px - ux * pz;
+	    double kzp = ux * py - uy * px;
+	    double dot = ux * px + uy * py + uz * pz;
+
+	    double rx = px * cA + kxp * sA + ux * dot * (1.0 - cA);
+	    double ry = py * cA + kyp * sA + uy * dot * (1.0 - cA);
+	    double rz = pz * cA + kzp * sA + uz * dot * (1.0 - cA);
+
+	    x = cx + rx; y = cy + ry; z = cz + rz;
+	}
+    }
+}
 
 enum class KState {
     Ignore,
+    Include_Transform,
+    Define_Transformation,
     Include,
     Node,
     Element_Beam,
@@ -434,25 +495,28 @@ bool parse_k
 	ret = false;
     }
     else {
-	KState                   state            = KState::Ignore;
-	size_t                   partLinesRead    = 0;
-	std::string              partTitle;
-	size_t                   sectionLinesRead = 0;
-	size_t                   elementLinesRead = 0;
-	size_t                   numberOfCards = 0;
-	//size_t                   cardCounter = 0;// this will replace sectionLinesRead elementLinesRead, and partLinesRead
-	size_t                   optionsCounter = 0;
+	KState                   state                     = KState::Ignore;
+	size_t                   partLinesRead             = 0;
+	std::string              partTitle;	           
+	size_t                   sectionLinesRead          = 0;
+	size_t                   elementLinesRead          = 0;
+	size_t                   numberOfCards             = 0;
+	//size_t                 cardCounter               = 0;// this will replace sectionLinesRead elementLinesRead, and partLinesRead
+	size_t                   optionsCounter            = 0;
+	size_t                   includeTransformLinesRead = 0;
+	int                      currentTransformTid       = -1;
+	bool                     inDefineTransformHeader   = false;
 	std::string              sectionTitle;
-	bool                     sectionHasOption = false;
-	int                      sectionId        = -1;
-	int                      sectionElForm    = 0;
-	//int                      CST              = 0;
-	std::string              line             = read_line(is);
-	ReadFormat               fileFormat = ReadFormat::Standard;
-	ReadFormat               nodeFormat = ReadFormat::Standard;
+	bool                     sectionHasOption          = false;
+	int                      sectionId                 = -1;
+	int                      sectionElForm             = 0;
+	//int                    CS  T                     = 0;
+	std::string              line                      = read_line(is);
+	ReadFormat               fileFormat                = ReadFormat::Standard;
+	ReadFormat               nodeFormat                = ReadFormat::Standard;
 	std::vector<std::string> nodeLines;//in old .k files a node with Long format is split in two lines.
 	std::vector<std::string> tokens;
-	const size_t FirstNode = 2;
+	const size_t FirstNode                             = 2;
 	std::vector<std::string> optionsContainer;
 	std::vector<Options> options;
 
@@ -479,8 +543,16 @@ bool parse_k
 			if (command[0] == "INCLUDE") {
 			    if (command.size() == 1)
 				state = KState::Include;
+			    else if (command.size() >= 2 && command[1] == "TRANSFORM")
+				state = KState::Include_Transform;
 			    else
 				std::cout << "Unexpected command " << tokens[0] << " in k-file " << fileName << std::endl;
+			}
+			else if (command[0] == "DEFINE" && command.size() >= 2 && command[1] == "TRANSFORMATION") {
+			    state = KState::Define_Transformation;
+
+			    currentTransformTid     = -1;
+			    inDefineTransformHeader = true;
 			}
 			else if (command[0] == "NODE") {
 			    if (command.size() == 1)
@@ -858,6 +930,116 @@ bool parse_k
 		    case KState::Include:
 			ret = parse_k(line.c_str(), data);
 			break;
+
+		    case KState::Define_Transformation: {
+
+			if (inDefineTransformHeader) {
+			    if (tokens.empty()) break;
+			    currentTransformTid = std::stoi(tokens[0]);
+			    gTransforms[currentTransformTid] = TransformDef{ currentTransformTid, {} };
+			    inDefineTransformHeader = false;
+			    break;
+			}
+
+			if (!tokens.empty()) {
+			    std::string op = tokens[0];
+			    for (auto& c : op) c = std::toupper(c);
+			    TransformOp o;
+
+			    if (op == "TRANSL" && tokens.size() >= 4) {
+				o.type = TransformOp::TRANSL;
+
+				o.a = std::stod(tokens[1]); o.b = std::stod(tokens[2]); o.c = std::stod(tokens[3]);
+				
+				gTransforms[currentTransformTid].ops.push_back(o);
+			    }
+			    else if (op == "ROTATE" && tokens.size() >= 8) {
+				o.type = TransformOp::ROTATE;
+
+				o.a = std::stod(tokens[1]); o.b = std::stod(tokens[2]); o.c = std::stod(tokens[3]);
+				o.d = std::stod(tokens[4]); o.e = std::stod(tokens[5]); o.f = std::stod(tokens[6]);
+				o.g = std::stod(tokens[7]);
+
+				gTransforms[currentTransformTid].ops.push_back(o);
+			    }
+			    else if (op == "SCALE" && tokens.size() >= 2) {
+				o.type = TransformOp::SCALE;
+
+				if (tokens.size() == 2) {
+				    o.a = o.b = o.c = std::stod(tokens[1]);
+				}
+				else {
+				    o.a = std::stod(tokens[1]); o.b = std::stod(tokens[2]); o.c = std::stod(tokens[3]);
+				    if (tokens.size() >= 7) { o.d = std::stod(tokens[4]); o.e = std::stod(tokens[5]); o.f = std::stod(tokens[6]); }
+				}
+
+				gTransforms[currentTransformTid].ops.push_back(o);
+			    }
+			}
+			break;
+		    }
+
+		    case KState::Include_Transform: {
+
+			if (includeTransformLinesRead == 0) {
+
+			    std::vector<int> before;
+			    before.reserve(data.nodes.size());
+			    
+			    for (const auto& kv : data.nodes) before.push_back(kv.first);
+
+			    ret = parse_k(line.c_str(), data);
+			    includeTransformLinesRead = 1;
+
+			    int tranId = 0;
+
+			    for (int i = 0; i < 4; ++i) {
+				std::streampos pos = is.tellg();
+				std::string l2 = read_line(is);
+				if (!is) break;
+				std::vector<std::string> t2 = parse_line(l2.c_str());
+				if (t2.size() > 0 && t2[0].size() > 0 && t2[0][0] == '*') {
+				    is.seekg(pos);
+				    break;
+				}
+
+				if (!t2.empty()) {
+				    bool numeric = (std::isdigit(t2[0][0]) || t2[0][0] == '-' || t2[0][0] == '+');
+				    if (numeric && t2.size() == 1) {
+					try { tranId = std::stoi(t2[0]); }
+					catch (...) {}
+				    }
+				}
+			    }
+
+			    std::unordered_set<int> before_set(before.begin(), before.end());
+			    std::vector<int> added;
+			    added.reserve(data.nodes.size());
+			    
+			    for (const auto& kv : data.nodes) {
+				if (!before_set.count(kv.first)) added.push_back(kv.first);
+			    }
+
+			    if (tranId > 0) {
+				auto itT = gTransforms.find(tranId);
+				if (itT != gTransforms.end()) {
+				    const TransformDef& T = itT->second;
+				    for (int nid : added) {
+					auto& n = data.nodes[nid];
+					apply_transform(n.x, n.y, n.z, T);
+				    }
+				}
+				else {
+				    std::cout << "Warning: TRANID=" << tranId << " not found for *INCLUDE_TRANSFORM\n";
+				}
+			    }
+
+			    state = KState::Ignore;
+			    includeTransformLinesRead = 0;
+			    continue;
+			}
+			break;
+		    }
 
 		    case KState::Node: {
 			if (nodeFormat == ReadFormat::Standard) {
